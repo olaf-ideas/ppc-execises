@@ -36,73 +36,66 @@ __global__ void matmul_kernel(const int my, const int mx, const int ny, const in
   const int ib = blockIdx.x;
   const int jb = blockIdx.y;
  
-  ///*
   if (ib < jb) {
     return; 
-   /* for (int ic = 0; ic < 8; ic++) {
-      for (int jc = 0; jc < 8; jc++) {
-        const int i = 64*ib + 8*ic + it;
-        const int j = 64*jb + 8*jc + jt;
-
-        if (i < ny && j < ny) {
-          r[ny*j + i] = 0;
-        }
-      }
-    }
-   */ 
-    return;
-  }//*/
+  }
    
-  __shared__ float di[2][64];
-  __shared__ float dj[2][64];
+  __shared__ float di[4][64];
+  __shared__ float dj[4][64];
 
   float v[8][8];
+
+  #pragma unroll
   for (int i = 0; i < 8; i++) {
+    #pragma unroll
     for (int j = 0; j < 8; j++) {
       v[i][j] = 0;
     }
   }
 
-  for (int ks = 0; ks < mx; ks += 2) {
+  {
     const int ij = 8*jt + it;
     const int i = 64*ib + ij;
     const int j = 64*jb + ij;
-    #pragma unroll
-    for (int f = 0; f < 2; f++) {
-      const int k = ks + f;
-      di[f][ij] = d[my*k + i];
-      dj[f][ij] = d[my*k + j];
-    }
-
-    __syncthreads();
-
-    #pragma unroll
-    for (int f = 0; f < 2; f++) {
-      float dj_reg[8];
+    for (int ks = 0; ks < mx; ks += 4) {
       #pragma unroll
-      for (int jc = 0; jc < 8; jc++) {
-        dj_reg[jc] = dj[f][8*jc + jt];
+      for (int f = 0; f < 4; f++) {
+        const int k = ks + f;
+        di[f][ij] = d[my*k + i];
+        dj[f][ij] = d[my*k + j];
       }
+
+      __syncthreads();
+
       #pragma unroll
-      for (int ic = 0; ic < 8; ic++) {
-        const float di_reg = di[f][8*ic + it];
+      for (int f = 0; f < 4; f++) {
+        float dj_reg[8];
         #pragma unroll
         for (int jc = 0; jc < 8; jc++) {
-          v[ic][jc] += di_reg * dj_reg[jc];
+          dj_reg[jc] = dj[f][8*jc + jt];
+        }
+        #pragma unroll
+        for (int ic = 0; ic < 8; ic++) {
+          const float di_reg = di[f][8*ic + it];
+          #pragma unroll
+          for (int jc = 0; jc < 8; jc++) {
+            v[ic][jc] += di_reg * dj_reg[jc];
+          }
         }
       }
-    }
 
-    __syncthreads();
+      __syncthreads();
+    }
   }
 
+  const float nx_inv = 1.0f / nx;
   for (int ic = 0; ic < 8; ic++) {
     for (int jc = 0; jc < 8; jc++) {
       const int i = 64*ib + 8*ic + it;
       const int j = 64*jb + 8*jc + jt;
 
       if (i < ny && j < ny) {
-        r[ny*j + i] = v[ic][jc] / nx;
+        r[ny*j + i] = v[ic][jc] * nx_inv;
       }
     }
   }
@@ -130,9 +123,9 @@ __global__ void norm_kernel(const int ny, const int nx, const int my, const int 
     std += (dd - avg) * (dd - avg);
   }
 
-  std = sqrt(std / nx);
+  std = 1.0f / sqrt(std / nx);
   for (int x = 0; x < nx; x++) {
-    dk[my*x + y] = (d[nx*y + x] - avg) / std;
+    dk[my*x + y] = (d[nx*y + x] - avg) * std;
   }
   for (int x = nx; x < mx; x++) {
     dk[my*x + y] = 0;
@@ -140,24 +133,23 @@ __global__ void norm_kernel(const int ny, const int nx, const int my, const int 
 }
 
 void correlate(int ny, int nx, const float *data, float *result) {
-  int mx = roundup(nx, 2); 
+  int mx = roundup(nx, 64); 
   int my = roundup(ny, 64);
 
   float* dataGPU = NULL;
-  float* resultGPU = NULL;
   float* dataKernel = NULL;
   
-  CHECK(cudaMalloc((void**)&dataGPU, ny * nx * sizeof(float)));
-  CHECK(cudaMalloc((void**)&resultGPU, ny * ny * sizeof(float)));
+  CHECK(cudaMalloc((void**)&dataGPU, ny * (nx > ny ? nx : ny) * sizeof(float)));
   CHECK(cudaMalloc((void**)&dataKernel, my * mx * sizeof(float)));
   CHECK(cudaMemcpy(dataGPU, data, ny * nx * sizeof(float), cudaMemcpyHostToDevice));
-  CHECK(cudaMemset(resultGPU, 0, ny * ny * sizeof(float)));
 
   {
     norm_kernel<<<64, my / 64>>>(ny, nx, my, mx, dataGPU, dataKernel);
     CHECK(cudaGetLastError());
   }
 
+  float* resultGPU = dataGPU;
+  CHECK(cudaMemset(resultGPU, 0, ny * ny * sizeof(float)));
   {
     dim3 dimBlock(8, 8);
     dim3 dimGrid(my / 64, my / 64);
@@ -167,6 +159,5 @@ void correlate(int ny, int nx, const float *data, float *result) {
   
   CHECK(cudaMemcpy(result, resultGPU, ny * ny * sizeof(float), cudaMemcpyDeviceToHost));
   CHECK(cudaFree(dataKernel));
-  CHECK(cudaFree(resultGPU));
   CHECK(cudaFree(dataGPU));
 }
